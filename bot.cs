@@ -29,6 +29,24 @@ namespace cAlgo.Robots
         [Parameter("Signal Marker anzeigen", DefaultValue = true)]
         public bool ShowSignalMarkers { get; set; }
 
+        [Parameter("Renko Wicks aktivieren", DefaultValue = false)]
+        public bool EnableRenkoWicks { get; set; }
+
+        [Parameter("Ticks laden ab", DefaultValue = cAlgo.RsiTrendlinesAuto.LoadTickFromData.Today)]
+        public cAlgo.RsiTrendlinesAuto.LoadTickFromData LoadTickFrom { get; set; }
+
+        [Parameter("Lade-Strategie", DefaultValue = cAlgo.RsiTrendlinesAuto.LoadTickStrategy.OnChartEndAsync)]
+        public cAlgo.RsiTrendlinesAuto.LoadTickStrategy TickLoadStrategy { get; set; }
+
+        [Parameter("Benutzerdefiniertes Datum (dd/MM/yyyy)", DefaultValue = "00/00/0000")]
+        public string CustomTickDate { get; set; }
+
+        [Parameter("Benachrichtigungen", DefaultValue = cAlgo.RsiTrendlinesAuto.LoadTickNotify.Minimal)]
+        public cAlgo.RsiTrendlinesAuto.LoadTickNotify TickNotifyMode { get; set; }
+
+        [Parameter("Wick-Linienstärke", DefaultValue = 1, MinValue = 1, MaxValue = 5)]
+        public int WickThickness { get; set; }
+
         private cAlgo.RsiTrendlinesAuto _rsiTl;
         private string _label;
 
@@ -40,7 +58,13 @@ namespace cAlgo.Robots
                 SearchBack,
                 ExtendBars,
                 ShowPivotMarkers,
-                ShowSignalMarkers
+                ShowSignalMarkers,
+                EnableRenkoWicks,
+                LoadTickFrom,
+                TickLoadStrategy,
+                CustomTickDate,
+                TickNotifyMode,
+                WickThickness
             );
             _label = $"RSI_TL_BOT_{SymbolName}_{TimeFrame}";
         }

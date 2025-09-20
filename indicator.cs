@@ -106,6 +106,9 @@ namespace cAlgo
         protected override void Initialize()
         {
             _rsi = Indicators.RelativeStrengthIndex(Bars.ClosePrices, Period);
+
+            if (EnableRenkoWicks)
+                InitializeRenkoWicks();
         }
 
         public override void Calculate(int index)
@@ -114,6 +117,9 @@ namespace cAlgo
             {
                 if (Bars == null)
                     return;
+
+                if (EnableRenkoWicks)
+                    ProcessRenkoWicks(index);
 
                 if (_rsi?.Result == null)
                 {
@@ -287,6 +293,509 @@ namespace cAlgo
             SignalAtPrevClose = prevState;
 
             // no logging
+        }
+
+        private void ProcessRenkoWicks(int index)
+        {
+            if (!_renkoInitialized || _renkoWrongTimeFrame)
+                return;
+
+            if (_tickBars == null || Bars == null)
+                return;
+
+            bool loadOnChart = TickLoadStrategy != LoadTickStrategy.AtStartupSync;
+            if (loadOnChart && !_loadingTicksComplete)
+                LoadMoreTicksOnChart();
+
+            bool asyncStrategy = TickLoadStrategy == LoadTickStrategy.OnChartEndAsync;
+            if (asyncStrategy && !_loadingTicksComplete)
+                return;
+
+            if (!IsLastBar)
+                DrawOnScreen(string.Empty);
+
+            if (index < 2)
+                return;
+
+            double highest = Bars.HighPrices[index];
+            double lowest = Bars.LowPrices[index];
+            double open = Bars.OpenPrices[index];
+
+            bool isBullish = Bars.ClosePrices[index] > Bars.OpenPrices[index];
+            bool prevIsBullish = Bars.ClosePrices[index - 1] > Bars.OpenPrices[index - 1];
+            bool priceGap = Bars.OpenTimes[index] == Bars[index - 1].OpenTime || Bars[index - 2].OpenTime == Bars[index - 1].OpenTime;
+            DateTime currentOpenTime = Bars.OpenTimes[index];
+            DateTime nextOpenTime = index + 1 < Bars.Count ? Bars.OpenTimes[index + 1] : Bars.OpenTimes[index];
+
+            double[] wicks = GetRenkoWicks(index, currentOpenTime, nextOpenTime);
+
+            if (IsLastBar)
+            {
+                lowest = wicks[0];
+                highest = wicks[1];
+                open = Bars.ClosePrices[index - 1];
+            }
+            else
+            {
+                if (isBullish)
+                    lowest = wicks[0];
+                else
+                    highest = wicks[1];
+            }
+
+            if (isBullish)
+            {
+                if (lowest < open && !priceGap)
+                {
+                    if (IsLastBar && !prevIsBullish && Bars.ClosePrices[index] > open)
+                        open = Bars.OpenPrices[index];
+                    var trendlineUp = Chart.DrawTrendLine($"UpWick_{index}", currentOpenTime, open, currentOpenTime, lowest, _renkoUpColor);
+                    trendlineUp.Thickness = WickThickness;
+                    Chart.RemoveObject($"DownWick_{index}");
+                }
+            }
+            else
+            {
+                if (highest > open && !priceGap)
+                {
+                    if (IsLastBar && prevIsBullish && Bars.ClosePrices[index] < open)
+                        open = Bars.OpenPrices[index];
+                    var trendlineDown = Chart.DrawTrendLine($"DownWick_{index}", currentOpenTime, open, currentOpenTime, highest, _renkoDownColor);
+                    trendlineDown.Thickness = WickThickness;
+                    Chart.RemoveObject($"UpWick_{index}");
+                }
+            }
+        }
+
+        private void InitializeRenkoWicks()
+        {
+            if (Chart == null)
+                return;
+
+            _renkoWrongTimeFrame = false;
+
+            string currentTimeframe = Chart.TimeFrame.ToString();
+            if (!currentTimeframe.Contains("Renko"))
+            {
+                DrawOnScreen("Renko Wicks\n funktioniert nur im Renko-Chart!");
+                _renkoWrongTimeFrame = true;
+                return;
+            }
+
+            _tickBars = MarketData.GetBars(TimeFrame.Tick);
+            _renkoUpColor = Chart.ColorSettings.BullOutlineColor;
+            _renkoDownColor = Chart.ColorSettings.BearOutlineColor;
+            _lastTickForWicks = 0;
+            _loadingAsyncTicks = false;
+            _loadingTicksComplete = TickLoadStrategy == LoadTickStrategy.AtStartupSync;
+            _requestAsyncLoad = false;
+
+            if (TickLoadStrategy != LoadTickStrategy.AtStartupSync)
+            {
+                if (TickLoadStrategy == LoadTickStrategy.OnChartStartSync)
+                {
+                    var panel = new StackPanel
+                    {
+                        Width = 200,
+                        Orientation = Orientation.Vertical,
+                        VerticalAlignment = VerticalAlignment.Center
+                    };
+                    _syncTickProgressBar = new ProgressBar { IsIndeterminate = true, Height = 12 };
+                    panel.AddChild(_syncTickProgressBar);
+                    Chart.AddControl(panel);
+                }
+
+                VolumeInitialize(true);
+            }
+            else
+            {
+                VolumeInitialize();
+            }
+
+            if (TickLoadStrategy != LoadTickStrategy.AtStartupSync)
+            {
+                Timer.Start(TimeSpan.FromSeconds(0.5));
+                DrawOnScreen("Loading Ticks Data...\n oder\nBerechnung läuft...");
+            }
+            else
+            {
+                DrawOnScreen(string.Empty);
+            }
+
+            _renkoInitialized = true;
+        }
+
+        private double[] GetRenkoWicks(int barIndex, DateTime startTime, DateTime endTime)
+        {
+            double min = double.MaxValue;
+            double max = double.MinValue;
+
+            if (IsLastBar && _tickBars != null && _tickBars.Count > 0)
+                endTime = _tickBars.LastBar.OpenTime;
+
+            if (_tickBars == null)
+                return new[] { Bars.LowPrices[barIndex], Bars.HighPrices[barIndex] };
+
+            for (int tickIndex = _lastTickForWicks; tickIndex < _tickBars.Count; tickIndex++)
+            {
+                var tickBar = _tickBars[tickIndex];
+
+                if (tickBar.OpenTime < startTime || tickBar.OpenTime > endTime)
+                {
+                    if (tickBar.OpenTime > endTime)
+                    {
+                        _lastTickForWicks = tickIndex;
+                        break;
+                    }
+                    continue;
+                }
+
+                if (tickBar.Close < min)
+                    min = tickBar.Close;
+                if (tickBar.Close > max)
+                    max = tickBar.Close;
+            }
+
+            if (min == double.MaxValue)
+                min = Bars.LowPrices[barIndex];
+            if (max == double.MinValue)
+                max = Bars.HighPrices[barIndex];
+
+            return new[] { min, max };
+        }
+
+        private void VolumeInitialize(bool onlyDate = false)
+        {
+            if (Bars == null)
+                return;
+
+            DateTime lastBarDate = Bars.LastBar.OpenTime.Date;
+
+            if (LoadTickFrom == LoadTickFromData.Custom)
+            {
+                if (DateTime.TryParseExact(CustomTickDate, "dd/MM/yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, out var customDate))
+                {
+                    if (customDate > lastBarDate)
+                        customDate = lastBarDate;
+                    _tickLoadFrom = customDate;
+                }
+                else
+                {
+                    _tickLoadFrom = lastBarDate;
+                    Notifications.ShowPopup(
+                        RenkoNotifyCaption,
+                        $"Ungültiges Datum '{CustomTickDate}'. Verwende {_tickLoadFrom:dd.MM.yyyy}",
+                        PopupNotificationState.Error
+                    );
+                }
+            }
+            else
+            {
+                _tickLoadFrom = LoadTickFrom switch
+                {
+                    LoadTickFromData.Yesterday => MarketData.GetBars(TimeFrame.Daily).LastBar.OpenTime.Date,
+                    LoadTickFromData.BeforeYesterday => MarketData.GetBars(TimeFrame.Daily).Last(1).OpenTime.Date,
+                    LoadTickFromData.OneWeek => MarketData.GetBars(TimeFrame.Weekly).LastBar.OpenTime.Date,
+                    LoadTickFromData.TwoWeek => MarketData.GetBars(TimeFrame.Weekly).Last(1).OpenTime.Date,
+                    LoadTickFromData.Monthly => MarketData.GetBars(TimeFrame.Monthly).LastBar.OpenTime.Date,
+                    _ => lastBarDate
+                };
+            }
+
+            if (onlyDate)
+            {
+                DrawStartVolumeLine();
+                return;
+            }
+
+            if (_tickBars == null || !_tickBars.Any())
+                return;
+
+            _firstTickTime = _tickBars.OpenTimes.FirstOrDefault();
+
+            if (_firstTickTime >= _tickLoadFrom)
+            {
+                PopupNotification progressPopup = null;
+                bool minimalNotify = TickNotifyMode == LoadTickNotify.Minimal;
+
+                if (minimalNotify)
+                {
+                    progressPopup = Notifications.ShowPopup(
+                        RenkoNotifyCaption,
+                        $"[{Symbol.Name}] Lade Tick-Daten synchron...",
+                        PopupNotificationState.InProgress
+                    );
+                }
+
+                while (_tickBars.OpenTimes.FirstOrDefault() > _tickLoadFrom)
+                {
+                    int loadedCount = _tickBars.LoadMoreHistory();
+                    if (TickNotifyMode == LoadTickNotify.Detailed)
+                    {
+                        Notifications.ShowPopup(
+                            RenkoNotifyCaption,
+                            $"[{Symbol.Name}] {loadedCount} Ticks geladen. Aktuelles Tick-Datum: {_tickBars.OpenTimes.FirstOrDefault():dd.MM.yyyy HH:mm:ss}",
+                            PopupNotificationState.Partial
+                        );
+                    }
+
+                    if (loadedCount == 0)
+                        break;
+                }
+
+                if (minimalNotify && progressPopup != null)
+                    progressPopup.Complete(PopupNotificationState.Success);
+                else if (!minimalNotify)
+                {
+                    Notifications.ShowPopup(
+                        RenkoNotifyCaption,
+                        $"[{Symbol.Name}] Tick-Daten synchron geladen.",
+                        PopupNotificationState.Success
+                    );
+                }
+            }
+
+            DrawStartVolumeLine();
+            _loadingTicksComplete = true;
+        }
+
+        private void DrawStartVolumeLine()
+        {
+            if (Chart == null || _tickBars == null || !_tickBars.Any())
+                return;
+
+            try
+            {
+                DateTime firstTickDate = _tickBars.OpenTimes.FirstOrDefault();
+                var line = Chart.DrawVerticalLine("RenkoTickStart", firstTickDate, Color.Red);
+                line.LineStyle = LineStyle.Lines;
+                int priceIndex = Bars.OpenTimes.GetIndexByTime(firstTickDate);
+                double price = priceIndex >= 0 ? Bars.HighPrices[priceIndex] : Bars.HighPrices.LastValue;
+                var text = Chart.DrawText(
+                    "RenkoTickStartText",
+                    "Tickdaten Endpunkt",
+                    firstTickDate,
+                    price,
+                    Color.Red
+                );
+                text.HorizontalAlignment = HorizontalAlignment.Right;
+                text.VerticalAlignment = VerticalAlignment.Top;
+                text.FontSize = 8;
+            }
+            catch
+            {
+                // ignore drawing issues
+            }
+        }
+
+        private void DrawFromDateLine()
+        {
+            if (Chart == null)
+                return;
+
+            try
+            {
+                var line = Chart.DrawVerticalLine("RenkoTickTarget", _tickLoadFrom, Color.Yellow);
+                line.LineStyle = LineStyle.Lines;
+                int priceIndex = Bars.OpenTimes.GetIndexByTime(_tickLoadFrom);
+                double price = priceIndex >= 0 ? Bars.HighPrices[priceIndex] : Bars.HighPrices.LastValue;
+                var text = Chart.DrawText(
+                    "RenkoTickTargetText",
+                    "Tick-Zieldatum",
+                    _tickLoadFrom,
+                    price,
+                    Color.Yellow
+                );
+                text.HorizontalAlignment = HorizontalAlignment.Left;
+                text.VerticalAlignment = VerticalAlignment.Center;
+                text.FontSize = 8;
+            }
+            catch
+            {
+            }
+        }
+
+        private void LoadMoreTicksOnChart()
+        {
+            if (_tickBars == null)
+                return;
+
+            _firstTickTime = _tickBars.OpenTimes.FirstOrDefault();
+
+            if (_firstTickTime > _tickLoadFrom)
+            {
+                bool minimalNotify = TickNotifyMode == LoadTickNotify.Minimal;
+                PopupNotification progressPopup = null;
+
+                if (TickLoadStrategy == LoadTickStrategy.OnChartStartSync)
+                {
+                    if (minimalNotify)
+                    {
+                        progressPopup = Notifications.ShowPopup(
+                            RenkoNotifyCaption,
+                            $"[{Symbol.Name}] Lade Tick-Daten synchron...",
+                            PopupNotificationState.InProgress
+                        );
+                    }
+
+                    while (_tickBars.OpenTimes.FirstOrDefault() > _tickLoadFrom)
+                    {
+                        int loadedCount = _tickBars.LoadMoreHistory();
+                        if (TickNotifyMode == LoadTickNotify.Detailed)
+                        {
+                            Notifications.ShowPopup(
+                                RenkoNotifyCaption,
+                                $"[{Symbol.Name}] {loadedCount} Ticks geladen. Aktuelles Tick-Datum: {_tickBars.OpenTimes.FirstOrDefault():dd.MM.yyyy HH:mm:ss}",
+                                PopupNotificationState.Partial
+                            );
+                        }
+
+                        if (loadedCount == 0)
+                            break;
+                    }
+
+                    if (minimalNotify && progressPopup != null)
+                        progressPopup.Complete(PopupNotificationState.Success);
+                    else if (!minimalNotify)
+                    {
+                        Notifications.ShowPopup(
+                            RenkoNotifyCaption,
+                            $"[{Symbol.Name}] Tick-Daten synchron geladen.",
+                            PopupNotificationState.Success
+                        );
+                    }
+
+                    UnlockChart();
+                }
+                else
+                {
+                    if (IsLastBar && !_loadingAsyncTicks)
+                    {
+                        _requestAsyncLoad = true;
+                    }
+                }
+            }
+            else
+            {
+                UnlockChart();
+            }
+
+            void UnlockChart()
+            {
+                if (_syncTickProgressBar != null)
+                {
+                    _syncTickProgressBar.IsIndeterminate = false;
+                    _syncTickProgressBar.IsVisible = false;
+                }
+                _syncTickProgressBar = null;
+                _loadingTicksComplete = true;
+                DrawStartVolumeLine();
+            }
+        }
+
+        private void DrawOnScreen(string message)
+        {
+            if (Chart == null)
+                return;
+
+            Chart.DrawStaticText("RenkoWicksMsg", message ?? string.Empty, VerticalAlignment.Top, HorizontalAlignment.Center, Color.LightBlue);
+        }
+
+        private void RecalculateRenkoWicks()
+        {
+            if (Bars == null || _tickBars == null)
+                return;
+
+            int startIndex = Bars.OpenTimes.GetIndexByTime(_tickBars.OpenTimes.FirstOrDefault());
+            if (startIndex < 2)
+                startIndex = 2;
+
+            for (int index = startIndex; index < Bars.Count - 1; index++)
+            {
+                bool isBullish = Bars.ClosePrices[index] > Bars.OpenPrices[index];
+                bool priceGap = Bars.OpenTimes[index] == Bars[index - 1].OpenTime || Bars[index - 2].OpenTime == Bars[index - 1].OpenTime;
+                DateTime currentOpenTime = Bars.OpenTimes[index];
+                DateTime nextOpenTime = index + 1 < Bars.Count ? Bars.OpenTimes[index + 1] : Bars.OpenTimes[index];
+
+                double[] wicks = GetRenkoWicks(index, currentOpenTime, nextOpenTime);
+
+                if (isBullish)
+                {
+                    double lowest = wicks[0];
+                    if (lowest < Bars.OpenPrices[index] && !priceGap)
+                    {
+                        var trendlineUp = Chart.DrawTrendLine($"UpWick_{index}", currentOpenTime, Bars.OpenPrices[index], currentOpenTime, lowest, _renkoUpColor);
+                        trendlineUp.Thickness = WickThickness;
+                        Chart.RemoveObject($"DownWick_{index}");
+                    }
+                }
+                else
+                {
+                    double highest = wicks[1];
+                    if (highest > Bars.OpenPrices[index] && !priceGap)
+                    {
+                        var trendlineDown = Chart.DrawTrendLine($"DownWick_{index}", currentOpenTime, Bars.OpenPrices[index], currentOpenTime, highest, _renkoDownColor);
+                        trendlineDown.Thickness = WickThickness;
+                        Chart.RemoveObject($"UpWick_{index}");
+                    }
+                }
+            }
+        }
+
+        protected override void OnTimer()
+        {
+            if (!_renkoInitialized || !_requestAsyncLoad)
+                return;
+
+            if (!_loadingAsyncTicks)
+            {
+                string volumeHint = "=> Bitte herauszoomen und der gelben Linie folgen";
+                _asyncTickPopup = Notifications.ShowPopup(
+                    RenkoNotifyCaption,
+                    $"[{Symbol.Name}] Lade Tick-Daten asynchron alle 0,5 Sekunden...\n{volumeHint}",
+                    PopupNotificationState.InProgress
+                );
+                DrawFromDateLine();
+            }
+
+            if (!_loadingTicksComplete)
+            {
+                _tickBars.LoadMoreHistoryAsync(result =>
+                {
+                    if (result?.Bars == null || result.Bars.Count == 0)
+                        return;
+
+                    DrawStartVolumeLine();
+
+                    DateTime currentDate = result.Bars.First().OpenTime;
+                    if (currentDate <= _tickLoadFrom)
+                    {
+                        if (_asyncTickPopup != null && _asyncTickPopup.State != PopupNotificationState.Success)
+                            _asyncTickPopup.Complete(PopupNotificationState.Success);
+
+                        if (TickNotifyMode == LoadTickNotify.Detailed)
+                        {
+                            Notifications.ShowPopup(
+                                RenkoNotifyCaption,
+                                $"[{Symbol.Name}] Asynchrones Laden beendet.",
+                                PopupNotificationState.Success
+                            );
+                        }
+
+                        _loadingTicksComplete = true;
+                    }
+                });
+
+                _loadingAsyncTicks = true;
+            }
+            else
+            {
+                Timer.Stop();
+                DrawOnScreen(string.Empty);
+                RecalculateRenkoWicks();
+                _requestAsyncLoad = false;
+                _loadingAsyncTicks = false;
+            }
         }
 
         private void DrawSignalMarker(int barIndex, int signal)
