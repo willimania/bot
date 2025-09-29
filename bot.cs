@@ -49,42 +49,87 @@ namespace cAlgo.Robots
 
         private cAlgo.RsiTrendlinesAuto _rsiTl;
         private string _label;
+        private DateTime _lastHandledSignalTime = DateTime.MinValue;
+        private int _lastHandledSignalBar = -1;
 
         protected override void OnStart()
         {
-            _rsiTl = Chart.Indicators.Add<cAlgo.RsiTrendlinesAuto>(
-                Period,
-                Swing,
-                SearchBack,
-                ExtendBars,
-                ShowPivotMarkers,
-                ShowSignalMarkers,
-                EnableRenkoWicks,
-                LoadTickFrom,
-                TickLoadStrategy,
-                CustomTickDate,
-                TickNotifyMode,
-                WickThickness
-            );
+            try
+            {
+                _rsiTl = Indicators.GetIndicator<cAlgo.RsiTrendlinesAuto>(
+                    Period,
+                    Swing,
+                    SearchBack,
+                    ExtendBars,
+                    ShowPivotMarkers,
+                    ShowSignalMarkers,
+                    EnableRenkoWicks,
+                    LoadTickFrom,
+                    TickLoadStrategy,
+                    CustomTickDate,
+                    TickNotifyMode,
+                    WickThickness
+                );
+
+                if (_rsiTl == null)
+                    Print("RSI Trendline Indicator konnte nicht geladen werden.");
+            }
+            catch (Exception ex)
+            {
+                Print($"Fehler bei Indicator-Initialisierung: {ex.Message}");
+            }
+
             _label = $"RSI_TL_BOT_{SymbolName}_{TimeFrame}";
         }
 
         protected override void OnBar()
         {
-            int lastClosed = Bars.Count - 2;
-            if (lastClosed < 1)
+            if (_rsiTl == null)
+            {
+                Print("OnBar: Indikator nicht geladen.");
                 return;
-
-            int signal = _rsiTl.SignalAtLastClose;
-
-            if (signal == 1)
-            {
-                ExecuteMarketOrder(TradeType.Buy, SymbolName, VolumeInUnits, _label);
             }
-            else if (signal == -1)
+
+            int lastClosed = Bars.Count - 2;
+            if (lastClosed < 0)
             {
-                ExecuteMarketOrder(TradeType.Sell, SymbolName, VolumeInUnits, _label);
+                Print("OnBar: Keine abgeschlossene Kerze verfügbar.");
+                return;
             }
+
+            int signalBar = lastClosed;
+            DateTime signalTime = Bars.OpenTimes[lastClosed];
+            int signal = _rsiTl.GetSignalForTime(signalTime);
+
+            if (signal == 0)
+            {
+                signalBar = _rsiTl.LastSignalBarIndex;
+                signalTime = _rsiTl.LastSignalTime;
+                signal = _rsiTl.LastSignalDirection;
+            }
+
+            if (signal == 0 || signalBar < 0)
+            {
+                Print($"OnBar: Signal 0 auf Bar {lastClosed}");
+                return;
+            }
+
+            if (signalTime <= _lastHandledSignalTime && signalBar == _lastHandledSignalBar)
+            {
+                Print($"OnBar: Signal {signal} auf Bar {signalBar} bereits verarbeitet");
+                return;
+            }
+
+            Print($"OnBar: Signal {signal} auf Bar {signalBar}");
+
+            _lastHandledSignalTime = signalTime;
+            _lastHandledSignalBar = signalBar;
+
+            var tradeType = signal == 1 ? TradeType.Buy : TradeType.Sell;
+            var result = ExecuteMarketOrder(tradeType, SymbolName, VolumeInUnits, _label, 5, 5);
+
+            if (result != null && !result.IsSuccessful && result.Error.HasValue)
+                Print($"Order error: {result.Error.Value}");
         }
 
         protected override void OnStop()

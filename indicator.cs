@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using cAlgo.API;
-using cAlgo.API.Controls;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
 
@@ -82,10 +81,17 @@ namespace cAlgo
 
         public int SignalAtLastClose { get; private set; }
         public int SignalAtPrevClose { get; private set; }
+        public int LastSignalBarIndex { get; private set; } = -1;
+        public int LastSignalDirection { get; private set; }
+        public DateTime LastSignalTime { get; private set; } = DateTime.MinValue;
 
         private RelativeStrengthIndex _rsi;
         private bool _loggedException;
         private readonly Dictionary<string, int> _signalMarkers = new Dictionary<string, int>();
+        private readonly Dictionary<int, double[]> _renkoWickCache = new Dictionary<int, double[]>();
+        private readonly Dictionary<int, int> _signalHistory = new Dictionary<int, int>();
+        private readonly Dictionary<long, int> _signalHistoryByTime = new Dictionary<long, int>();
+        private readonly Dictionary<int, long> _signalIndexToTime = new Dictionary<int, long>();
 
         // Renko Wicks
         private const string RenkoNotifyCaption = "Renko Wicks";
@@ -290,9 +296,112 @@ namespace cAlgo
                                 && (!double.IsNaN(rsiPrevVal) && (double.IsNaN(TrendLowAtPrevClose) || rsiPrevVal >= TrendLowAtPrevClose));
 
             SignalAtLastClose = breakoutUp ? 1 : breakoutDown ? -1 : 0;
+
+            UpdateSignalHistory(lastClosed, SignalAtLastClose);
             SignalAtPrevClose = prevState;
 
+            if (Bars != null && lastClosed >= 0 && lastClosed < Bars.Count)
+                Print($"Indicator: Signal {SignalAtLastClose} auf Bar {lastClosed}");
+
+            if (SignalAtLastClose != 0)
+            {
+                LastSignalBarIndex = lastClosed;
+                LastSignalDirection = SignalAtLastClose;
+                LastSignalTime = Bars.OpenTimes[lastClosed];
+            }
+
             // no logging
+        }
+
+        private void UpdateSignalHistory(int barIndex, int signal)
+        {
+            if (barIndex < 0 || Bars == null || barIndex >= Bars.Count)
+                return;
+
+            long timeKey = Bars.OpenTimes[barIndex].ToBinary();
+
+            if (_signalHistory.TryGetValue(barIndex, out int existingByIndex))
+            {
+                if (existingByIndex != 0 && signal == 0)
+                    return;
+
+                if (existingByIndex == signal)
+                    return;
+            }
+            else if (signal == 0)
+                return;
+
+            _signalHistory[barIndex] = signal;
+            _signalIndexToTime[barIndex] = timeKey;
+
+            if (_signalHistoryByTime.TryGetValue(timeKey, out int existingByTime))
+            {
+                if (existingByTime != 0 && signal == 0)
+                    return;
+
+                if (existingByTime == signal)
+                    return;
+            }
+            else if (signal == 0)
+                return;
+
+            _signalHistoryByTime[timeKey] = signal;
+
+            if (SearchBack <= 0)
+                return;
+
+            int minIndex = barIndex - SearchBack;
+            if (minIndex <= 0)
+                return;
+
+            var outdated = _signalHistory.Keys.Where(k => k < minIndex).ToList();
+            foreach (var key in outdated)
+            {
+                _signalHistory.Remove(key);
+                if (_signalIndexToTime.TryGetValue(key, out long mappedTime))
+                {
+                    _signalHistoryByTime.Remove(mappedTime);
+                    _signalIndexToTime.Remove(key);
+                }
+            }
+        }
+
+        public int GetSignalForBar(int barIndex)
+        {
+            if (barIndex < 0)
+                return 0;
+
+            if (_signalHistory.TryGetValue(barIndex, out int signal))
+                return signal;
+
+            if (Bars != null && barIndex < Bars.Count)
+                return GetSignalForTime(Bars.OpenTimes[barIndex]);
+
+            return 0;
+        }
+
+        public int GetSignalForTime(DateTime barOpenTime)
+        {
+            long timeKey = barOpenTime.ToBinary();
+            return _signalHistoryByTime.TryGetValue(timeKey, out int signal) ? signal : 0;
+        }
+
+        public bool TryGetSignal(int barIndex, out int signal)
+        {
+            signal = 0;
+            if (barIndex < 0)
+                return false;
+
+            if (_signalHistory.TryGetValue(barIndex, out signal))
+                return true;
+
+            if (Bars != null && barIndex < Bars.Count)
+            {
+                signal = GetSignalForTime(Bars.OpenTimes[barIndex]);
+                return signal != 0;
+            }
+
+            return false;
         }
 
         private void ProcessRenkoWicks(int index)
@@ -328,6 +437,7 @@ namespace cAlgo
             DateTime nextOpenTime = index + 1 < Bars.Count ? Bars.OpenTimes[index + 1] : Bars.OpenTimes[index];
 
             double[] wicks = GetRenkoWicks(index, currentOpenTime, nextOpenTime);
+            StoreRenkoWicks(index, wicks);
 
             if (IsLastBar)
             {
@@ -364,6 +474,55 @@ namespace cAlgo
                     trendlineDown.Thickness = WickThickness;
                     Chart.RemoveObject($"UpWick_{index}");
                 }
+            }
+        }
+
+        public bool TryGetRenkoWickRange(int barIndex, out double wickLow, out double wickHigh)
+        {
+            wickLow = double.NaN;
+            wickHigh = double.NaN;
+
+            if (Bars == null || barIndex < 0 || barIndex >= Bars.Count)
+                return false;
+
+            double fallbackLow = Bars.LowPrices[barIndex];
+            double fallbackHigh = Bars.HighPrices[barIndex];
+
+            if (_renkoWickCache.TryGetValue(barIndex, out double[] cached) && cached != null && cached.Length >= 2)
+            {
+                wickLow = cached[0];
+                wickHigh = cached[1];
+            }
+            else
+            {
+                wickLow = fallbackLow;
+                wickHigh = fallbackHigh;
+                return false;
+            }
+
+            if (wickLow > wickHigh)
+            {
+                double temp = wickLow;
+                wickLow = wickHigh;
+                wickHigh = temp;
+            }
+
+            return true;
+        }
+
+        private void StoreRenkoWicks(int index, double[] wicks)
+        {
+            if (wicks == null || wicks.Length < 2)
+                return;
+
+            _renkoWickCache[index] = new[] { wicks[0], wicks[1] };
+
+            if (_renkoWickCache.Count > 1000)
+            {
+                int threshold = Math.Max(0, index - SearchBack - 50);
+                var obsoleteKeys = _renkoWickCache.Keys.Where(k => k < threshold).ToList();
+                foreach (int key in obsoleteKeys)
+                    _renkoWickCache.Remove(key);
             }
         }
 
@@ -718,6 +877,7 @@ namespace cAlgo
                 DateTime nextOpenTime = index + 1 < Bars.Count ? Bars.OpenTimes[index + 1] : Bars.OpenTimes[index];
 
                 double[] wicks = GetRenkoWicks(index, currentOpenTime, nextOpenTime);
+                StoreRenkoWicks(index, wicks);
 
                 if (isBullish)
                 {
@@ -869,6 +1029,13 @@ namespace cAlgo
             TrendLowAtPrevClose  = double.NaN;
             SignalAtLastClose = 0;
             SignalAtPrevClose = 0;
+            _signalHistory.Clear();
+            _signalHistoryByTime.Clear();
+            _signalIndexToTime.Clear();
+            _renkoWickCache.Clear();
+            LastSignalBarIndex = -1;
+            LastSignalDirection = 0;
+            LastSignalTime = DateTime.MinValue;
         }
 
         private (bool found, int i1, int i2) FindLastTwoPivotHighs(IndicatorDataSeries series, int from, int to, int swing)
